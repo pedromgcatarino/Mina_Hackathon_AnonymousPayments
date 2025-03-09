@@ -1,17 +1,171 @@
-'use client';
-import Head from 'next/head';
-import Image from 'next/image';
-import {useCallback, useEffect, useRef, useState} from 'react';
-import GradientBG from '../components/GradientBG.js';
-import styles from '../styles/Home.module.css';
-import heroMinaLogo from '../public/assets/hero-mina-logo.svg';
-import arrowRightSmall from '../public/assets/arrow-right-small.svg';
-import {fetchAccount, Mina, PublicKey} from "o1js";
-import {Add} from "../../contracts";
+"use client";
+import Head from "next/head";
+import Image from "next/image";
+import { useCallback, useEffect, useRef, useState } from "react";
+import GradientBG from "../components/GradientBG.js";
+import styles from "../styles/Home.module.css";
+import heroMinaLogo from "../public/assets/hero-mina-logo.svg";
+import arrowRightSmall from "../public/assets/arrow-right-small.svg";
+import {
+  AccountUpdate,
+  fetchAccount,
+  Field,
+  MerkleMap,
+  Mina,
+  Poseidon,
+  PrivateKey,
+  PublicKey,
+  Signature,
+} from "o1js";
+import { MinaCash } from "../../contracts";
 
 // We've already deployed the Add contract on testnet at this address
 // https://minascan.io/devnet/account/B62qnTDEeYtBHBePA4yhCt4TCgDtA4L2CGvK7PirbJyX4pKH8bmtWe5
 const zkAppAddress = "B62qnTDEeYtBHBePA4yhCt4TCgDtA4L2CGvK7PirbJyX4pKH8bmtWe5";
+
+// STORAGE
+const balanceMap = new MerkleMap();
+const unstableBalanceMap = new MerkleMap();
+const txNullifierMap = new MerkleMap();
+const reputationMap = new MerkleMap();
+
+// GENERATE ACCOUNT KEYS
+const deployerAccount = Local.testAccounts[0];
+const deployerKey = Local.testAccounts[0].key;
+const serverAccount = Local.testAccounts[1];
+const serverKey = Local.testAccounts[1].key;
+const userAccount = Local.testAccounts[2];
+const userKey = Local.testAccounts[2].key;
+
+const destinationKey = PrivateKey.random();
+const destinationAddress = destinationKey.toPublicKey();
+
+// DEPLOY CONTRACT
+const zkAppPrivateKey = PrivateKey.random();
+const zkAddress = zkAppPrivateKey.toPublicKey();
+const zkApp = new MinaCash(zkAddress);
+
+const deployTx = await Mina.transaction(deployerAccount, async () => {
+  AccountUpdate.fundNewAccount(deployerAccount);
+  await zkApp.deploy();
+  await zkApp.initRoots(
+    unstableBalanceMap.getRoot(),
+    balanceMap.getRoot(),
+    reputationMap.getRoot()
+  );
+});
+await deployTx.prove();
+await deployTx.sign([deployerKey, zkAppPrivateKey]).send();
+
+// MOCK SERVER
+
+// Endpoint to receive proofs
+async function verifyDeposit(publicKey: PublicKey) {
+  const hashedKey = Poseidon.hash(publicKey.toFields());
+  const witness = unstableBalanceMap.getWitness(hashedKey);
+  const prevBalance = unstableBalanceMap.get(hashedKey);
+
+  // call smart contract
+  const tx = await Mina.transaction(serverAccount, async () => {
+    zkApp.verifyDeposit(publicKey, witness, prevBalance);
+  });
+  await tx.prove();
+  await tx.sign([serverKey]).send();
+
+  unstableBalanceMap.set(hashedKey, prevBalance.add(Field(100)));
+
+  console.log("Deposit verified");
+  console.log("Current unstable balance: " + unstableBalanceMap.get(hashedKey));
+  console.log("Current stable balance: " + balanceMap.get(hashedKey));
+}
+
+async function confirmDeposit(publicKey: PublicKey, txHash: Field) {
+  const hashedKey = Poseidon.hash(publicKey.toFields());
+
+  // check if txHash has been used already
+  const nullifier = txNullifierMap.get(txHash);
+
+  if (nullifier == Field(1)) {
+    console.log("Deposit already confirmed");
+    return;
+  } else {
+    txNullifierMap.set(txHash, Field(1));
+    const unstableBalance = unstableBalanceMap.get(hashedKey);
+
+    //Check if hash references a valid deposit
+    const verified = true && unstableBalance.greaterThanOrEqual(Field(100));
+
+    if (verified) {
+      const unstableWitness = unstableBalanceMap.getWitness(hashedKey);
+      const stableWitness = balanceMap.getWitness(hashedKey);
+
+      const prevStableBalance = balanceMap.get(hashedKey);
+
+      // call smart contract
+      const tx = await Mina.transaction(serverAccount, async () => {
+        zkApp.makeDeposit(
+          publicKey,
+          unstableWitness,
+          stableWitness,
+          unstableBalance,
+          prevStableBalance
+        );
+      });
+      await tx.prove();
+      await tx.sign([serverKey]).send();
+
+      balanceMap.set(hashedKey, prevStableBalance.add(Field(100)));
+      unstableBalanceMap.set(hashedKey, unstableBalance.sub(Field(100)));
+
+      console.log("Deposit made");
+      console.log(
+        "Current unstable balance: " + unstableBalanceMap.get(hashedKey)
+      );
+      console.log("Current stable balance: " + balanceMap.get(hashedKey));
+    }
+  }
+}
+
+async function makePayment(
+  publicKey: PublicKey,
+  amount: Field,
+  destination: PublicKey
+) {
+  const hashedKey = Poseidon.hash(publicKey.toFields());
+  const balance = balanceMap.get(hashedKey);
+  const witness = balanceMap.getWitness(hashedKey);
+  const reputation = reputationMap.get(hashedKey);
+
+  // call smart contract
+  const tx = await Mina.transaction(serverAccount, async () => {
+    let hash = Poseidon.hash(
+      destination.toFields().concat(publicKey.toFields())
+    ); // takes array of Fields, returns Field
+
+    let msg = [hash];
+    let sig = Signature.create(userKey, msg);
+    AccountUpdate.fundNewAccount(serverAccount);
+    zkApp.makePayment(
+      amount,
+      publicKey,
+      destination,
+      witness,
+      balance,
+      reputation,
+      sig
+    );
+  });
+  await tx.prove();
+  await tx.sign([serverKey]).send();
+
+  balanceMap.set(hashedKey, balance.sub(amount));
+  reputationMap.set(hashedKey, reputation.add(1));
+
+  console.log("Payment made");
+  console.log("Current unstable balance: " + unstableBalanceMap.get(hashedKey));
+  console.log("Current stable balance: " + balanceMap.get(hashedKey));
+  console.log("Current reputation: " + reputationMap.get(hashedKey));
+}
 
 export default function Home() {
   const zkApp = useRef<Add>(new Add(PublicKey.fromBase58(zkAppAddress)));
@@ -24,13 +178,17 @@ export default function Home() {
   // fetch the zkapp state when the page loads
   useEffect(() => {
     (async () => {
-      Mina.setActiveInstance(Mina.Network('https://api.minascan.io/node/devnet/v1/graphql'));
-      await fetchAccount({publicKey: zkAppAddress});
+      Mina.setActiveInstance(
+        Mina.Network("https://api.minascan.io/node/devnet/v1/graphql")
+      );
+      await fetchAccount({ publicKey: zkAppAddress });
       const num = zkApp.current.num.get();
       setContractState(num.toString());
 
       // Compile the contract so that o1js has the proving key required to execute contract calls
-      console.log("Compiling Add contract to generate proving and verification keys");
+      console.log(
+        "Compiling Add contract to generate proving and verification keys"
+      );
       await Add.compile();
 
       setLoading(false);
@@ -46,7 +204,7 @@ export default function Home() {
       const mina = (window as any).mina;
       const walletKey: string = (await mina.requestAccounts())[0];
       console.log("Connected wallet address: " + walletKey);
-      await fetchAccount({publicKey: PublicKey.fromBase58(walletKey)});
+      await fetchAccount({ publicKey: PublicKey.fromBase58(walletKey) });
 
       // Execute a transaction locally on the browser
       const transaction = await Mina.transaction(async () => {
@@ -60,7 +218,9 @@ export default function Home() {
 
       // Broadcast the transaction to the Mina network
       console.log("Broadcasting proof of execution to the Mina network");
-      const {hash} = await mina.sendTransaction({transaction: transaction.toJSON()});
+      const { hash } = await mina.sendTransaction({
+        transaction: transaction.toJSON(),
+      });
 
       // display the link to the transaction
       const transactionLink = "https://minascan.io/devnet/tx/" + hash;
@@ -69,7 +229,11 @@ export default function Home() {
       console.error(e.message);
       let errorMessage = "";
 
-      if (e.message.includes("Cannot read properties of undefined (reading 'requestAccounts')")) {
+      if (
+        e.message.includes(
+          "Cannot read properties of undefined (reading 'requestAccounts')"
+        )
+      ) {
         errorMessage = "Is Auro installed?";
       } else if (e.message.includes("Please create or restore wallet first.")) {
         errorMessage = "Have you created a wallet?";
@@ -88,8 +252,8 @@ export default function Home() {
     <>
       <Head>
         <title>Mina zkApp UI</title>
-        <meta name="description" content="built with o1js"/>
-        <link rel="icon" href="/assets/favicon.ico"/>
+        <meta name="description" content="built with o1js" />
+        <link rel="icon" href="/assets/favicon.ico" />
       </Head>
       <GradientBG>
         <main className={styles.main}>
@@ -119,16 +283,28 @@ export default function Home() {
           </p>
           <div className={styles.state}>
             <div>
-              <div>Contract State: <span className={styles.bold}>{contractState}</span></div>
+              <div>
+                Contract State:{" "}
+                <span className={styles.bold}>{contractState}</span>
+              </div>
               {error ? (
                 <span className={styles.error}>Error: {error}</span>
-              ) : (loading ?
-                <div>Loading...</div> :
-                (transactionLink ?
-                  <a href={transactionLink} className={styles.bold} target="_blank" rel="noopener noreferrer">
-                    View Transaction on MinaScan
-                  </a> :
-                  <button onClick={updateZkApp} className={styles.button}>Call Add.update()</button>))}
+              ) : loading ? (
+                <div>Loading...</div>
+              ) : transactionLink ? (
+                <a
+                  href={transactionLink}
+                  className={styles.bold}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  View Transaction on MinaScan
+                </a>
+              ) : (
+                <button onClick={updateZkApp} className={styles.button}>
+                  Call Add.update()
+                </button>
+              )}
             </div>
           </div>
           <div className={styles.grid}>

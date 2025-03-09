@@ -1,3 +1,3 @@
-import { Add } from './Add.js';
+import { MinaCash } from './MinaCash.js';
 
-export { Add };
+export { MinaCash };

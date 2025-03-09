@@ -1,111 +1,182 @@
-/**
- * This script can be used to interact with the Add contract, after deploying it.
- *
- * We call the update() method on the contract, create a proof and send it to the chain.
- * The endpoint that we interact with is read from your config.json.
- *
- * This simulates a user interacting with the zkApp from a browser, except that here, sending the transaction happens
- * from the script and we're using your pre-funded zkApp account to pay the transaction fee. In a real web app, the user's wallet
- * would send the transaction and pay the fee.
- *
- * To run locally:
- * Build the project: `$ npm run build`
- * Run with node:     `$ node build/src/interact.js <deployAlias>`.
- */
-import fs from 'fs/promises';
-import { Mina, NetworkId, PrivateKey } from 'o1js';
-import { Add } from './Add.js';
+import {
+  AccountUpdate,
+  Field,
+  MerkleMap,
+  Mina,
+  PendingTransaction,
+  PendingTransactionPromise,
+  Poseidon,
+  PrivateKey,
+  PublicKey,
+  Signature,
+} from 'o1js';
+import { MinaCash } from './MinaCash.js';
 
-// check command line arg
-const deployAlias = process.argv[2];
-if (!deployAlias)
-  throw Error(`Missing <deployAlias> argument.
+const Local = await Mina.LocalBlockchain({ proofsEnabled: false });
+Mina.setActiveInstance(Local);
 
-Usage:
-node build/src/interact.js <deployAlias>
-`);
-Error.stackTraceLimit = 1000;
-const DEFAULT_NETWORK_ID = 'testnet';
+// STORAGE
+const balanceMap = new MerkleMap();
+const unstableBalanceMap = new MerkleMap();
+const txNullifierMap = new MerkleMap();
+const reputationMap = new MerkleMap();
 
-// parse config and private key from file
-type Config = {
-  deployAliases: Record<
-    string,
-    {
-      networkId?: string;
-      url: string;
-      keyPath: string;
-      fee: string;
-      feepayerKeyPath: string;
-      feepayerAlias: string;
-    }
-  >;
-};
-const configJson: Config = JSON.parse(await fs.readFile('config.json', 'utf8'));
-const config = configJson.deployAliases[deployAlias];
-const feepayerKeysBase58: { privateKey: string; publicKey: string } =
-  JSON.parse(await fs.readFile(config.feepayerKeyPath, 'utf8'));
+// GENERATE ACCOUNT KEYS
+const deployerAccount = Local.testAccounts[0];
+const deployerKey = Local.testAccounts[0].key;
+const serverAccount = Local.testAccounts[1];
+const serverKey = Local.testAccounts[1].key;
+const userAccount = Local.testAccounts[2];
+const userKey = Local.testAccounts[2].key;
 
-const zkAppKeysBase58: { privateKey: string; publicKey: string } = JSON.parse(
-  await fs.readFile(config.keyPath, 'utf8')
-);
+const destinationKey = PrivateKey.random();
+const destinationAddress = destinationKey.toPublicKey();
 
-const feepayerKey = PrivateKey.fromBase58(feepayerKeysBase58.privateKey);
-const zkAppKey = PrivateKey.fromBase58(zkAppKeysBase58.privateKey);
+// DEPLOY CONTRACT
+const zkAppPrivateKey = PrivateKey.random();
+const zkAppAddress = zkAppPrivateKey.toPublicKey();
+const zkApp = new MinaCash(zkAppAddress);
 
-// set up Mina instance and contract we interact with
-const Network = Mina.Network({
-  // We need to default to the testnet networkId if none is specified for this deploy alias in config.json
-  // This is to ensure the backward compatibility.
-  networkId: (config.networkId ?? DEFAULT_NETWORK_ID) as NetworkId,
-  mina: config.url,
-});
-// const Network = Mina.Network(config.url);
-const fee = Number(config.fee) * 1e9; // in nanomina (1 billion = 1.0 mina)
-Mina.setActiveInstance(Network);
-const feepayerAddress = feepayerKey.toPublicKey();
-const zkAppAddress = zkAppKey.toPublicKey();
-const zkApp = new Add(zkAppAddress);
-
-// compile the contract to create prover keys
-console.log('compile the contract...');
-await Add.compile();
-
-try {
-  // call update() and send transaction
-  console.log('build transaction and create proof...');
-  const tx = await Mina.transaction(
-    { sender: feepayerAddress, fee },
-    async () => {
-      await zkApp.update();
-    }
+const deployTx = await Mina.transaction(deployerAccount, async () => {
+  AccountUpdate.fundNewAccount(deployerAccount);
+  await zkApp.deploy();
+  await zkApp.initRoots(
+    unstableBalanceMap.getRoot(),
+    balanceMap.getRoot(),
+    reputationMap.getRoot()
   );
+});
+await deployTx.prove();
+await deployTx.sign([deployerKey, zkAppPrivateKey]).send();
+
+// MOCK SERVER
+
+// Endpoint to receive proofs
+async function verifyDeposit(publicKey: PublicKey) {
+  const hashedKey = Poseidon.hash(publicKey.toFields());
+  const witness = unstableBalanceMap.getWitness(hashedKey);
+  const prevBalance = unstableBalanceMap.get(hashedKey);
+
+  // call smart contract
+  const tx = await Mina.transaction(serverAccount, async () => {
+    zkApp.verifyDeposit(publicKey, witness, prevBalance);
+  });
   await tx.prove();
+  await tx.sign([serverKey]).send();
 
-  console.log('send transaction...');
-  const sentTx = await tx.sign([feepayerKey]).send();
-  if (sentTx.status === 'pending') {
-    console.log(
-      '\nSuccess! Update transaction sent.\n' +
-        '\nYour smart contract state will be updated' +
-        '\nas soon as the transaction is included in a block:' +
-        `\n${getTxnUrl(config.url, sentTx.hash)}`
+  unstableBalanceMap.set(hashedKey, prevBalance.add(Field(100)));
+
+  console.log('Deposit verified');
+  console.log('Current unstable balance: ' + unstableBalanceMap.get(hashedKey));
+  console.log('Current stable balance: ' + balanceMap.get(hashedKey));
+}
+
+async function confirmDeposit(publicKey: PublicKey, txHash: Field) {
+  const hashedKey = Poseidon.hash(publicKey.toFields());
+
+  // check if txHash has been used already
+  const nullifier = txNullifierMap.get(txHash);
+
+  if (nullifier == Field(1)) {
+    console.log('Deposit already confirmed');
+    return;
+  } else {
+    txNullifierMap.set(txHash, Field(1));
+    const unstableBalance = unstableBalanceMap.get(hashedKey);
+
+    //Check if hash references a valid deposit
+    const verified = true && unstableBalance.greaterThanOrEqual(Field(100));
+
+    if (verified) {
+      const unstableWitness = unstableBalanceMap.getWitness(hashedKey);
+      const stableWitness = balanceMap.getWitness(hashedKey);
+
+      const prevStableBalance = balanceMap.get(hashedKey);
+
+      // call smart contract
+      const tx = await Mina.transaction(serverAccount, async () => {
+        zkApp.makeDeposit(
+          publicKey,
+          unstableWitness,
+          stableWitness,
+          unstableBalance,
+          prevStableBalance
+        );
+      });
+      await tx.prove();
+      await tx.sign([serverKey]).send();
+
+      balanceMap.set(hashedKey, prevStableBalance.add(Field(100)));
+      unstableBalanceMap.set(hashedKey, unstableBalance.sub(Field(100)));
+
+      console.log('Deposit made');
+      console.log(
+        'Current unstable balance: ' + unstableBalanceMap.get(hashedKey)
+      );
+      console.log('Current stable balance: ' + balanceMap.get(hashedKey));
+    }
+  }
+}
+
+async function makePayment(
+  publicKey: PublicKey,
+  amount: Field,
+  destination: PublicKey
+) {
+  const hashedKey = Poseidon.hash(publicKey.toFields());
+  const balance = balanceMap.get(hashedKey);
+  const witness = balanceMap.getWitness(hashedKey);
+  const reputation = reputationMap.get(hashedKey);
+
+  // call smart contract
+  const tx = await Mina.transaction(serverAccount, async () => {
+    let hash = Poseidon.hash(
+      destination.toFields().concat(publicKey.toFields())
+    ); // takes array of Fields, returns Field
+
+    let msg = [hash];
+    let sig = Signature.create(userKey, msg);
+    AccountUpdate.fundNewAccount(serverAccount);
+    zkApp.makePayment(
+      amount,
+      publicKey,
+      destination,
+      witness,
+      balance,
+      reputation,
+      sig
     );
-  }
-} catch (err) {
-  console.log(err);
+  });
+  await tx.prove();
+  await tx.sign([serverKey]).send();
+
+  balanceMap.set(hashedKey, balance.sub(amount));
+  reputationMap.set(hashedKey, reputation.add(1));
+
+  console.log('Payment made');
+  console.log('Current unstable balance: ' + unstableBalanceMap.get(hashedKey));
+  console.log('Current stable balance: ' + balanceMap.get(hashedKey));
+  console.log('Current reputation: ' + reputationMap.get(hashedKey));
 }
 
-function getTxnUrl(graphQlUrl: string, txnHash: string | undefined) {
-  const hostName = new URL(graphQlUrl).hostname;
-  const txnBroadcastServiceName = hostName
-    .split('.')
-    .filter((item) => item === 'minascan')?.[0];
-  const networkName = graphQlUrl
-    .split('/')
-    .filter((item) => item === 'mainnet' || item === 'devnet')?.[0];
-  if (txnBroadcastServiceName && networkName) {
-    return `https://minascan.io/${networkName}/tx/${txnHash}?type=zk-tx`;
-  }
-  return `Transaction hash: ${txnHash}`;
-}
+// MOCK USER
+// Ask server for deposit
+await verifyDeposit(userAccount.key.toPublicKey());
+// Send tx
+// call smart contract
+const tx = await Mina.transaction(userAccount, async () => {
+  // Not working -> Error: Transaction failed with errors: [[],[["Cancelled"]],[["Cancelled"]],[["Overflow"]],[["Cancelled"]]]
+  //AccountUpdate.fundNewAccount(userAccount);
+  //zkApp.sendFunds(destinationAddress);
+});
+await tx.prove();
+await tx.sign([userKey, destinationKey]).send();
+console.log('Funds sent');
+
+// GET HASH
+//const res: PendingTransaction = await tx.sign([userKey]).send();
+//const hash = res.hash;
+
+await confirmDeposit(userAccount.key.toPublicKey(), Field(1));
+
+await makePayment(userAccount.key.toPublicKey(), Field(50), destinationAddress);
