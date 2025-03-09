@@ -9,6 +9,7 @@ import {
   PrivateKey,
   PublicKey,
   Signature,
+  UInt64,
 } from 'o1js';
 import { MinaCash } from './MinaCash.js';
 
@@ -29,7 +30,8 @@ const serverKey = Local.testAccounts[1].key;
 const userAccount = Local.testAccounts[2];
 const userKey = Local.testAccounts[2].key;
 
-const destinationKey = PrivateKey.random();
+const destinationAccount = Local.testAccounts[3];
+const destinationKey = Local.testAccounts[3].key;
 const destinationAddress = destinationKey.toPublicKey();
 
 // DEPLOY CONTRACT
@@ -64,7 +66,7 @@ async function verifyDeposit(publicKey: PublicKey) {
   await tx.prove();
   await tx.sign([serverKey]).send();
 
-  unstableBalanceMap.set(hashedKey, prevBalance.add(Field(100)));
+  unstableBalanceMap.set(hashedKey, prevBalance.add(Field(1000000)));
 
   console.log('Deposit verified');
   console.log('Current unstable balance: ' + unstableBalanceMap.get(hashedKey));
@@ -85,7 +87,7 @@ async function confirmDeposit(publicKey: PublicKey, txHash: Field) {
     const unstableBalance = unstableBalanceMap.get(hashedKey);
 
     //Check if hash references a valid deposit
-    const verified = true && unstableBalance.greaterThanOrEqual(Field(100));
+    const verified = true && unstableBalance.greaterThanOrEqual(Field(1000000));
 
     if (verified) {
       const unstableWitness = unstableBalanceMap.getWitness(hashedKey);
@@ -106,8 +108,8 @@ async function confirmDeposit(publicKey: PublicKey, txHash: Field) {
       await tx.prove();
       await tx.sign([serverKey]).send();
 
-      balanceMap.set(hashedKey, prevStableBalance.add(Field(100)));
-      unstableBalanceMap.set(hashedKey, unstableBalance.sub(Field(100)));
+      balanceMap.set(hashedKey, prevStableBalance.add(Field(1000000)));
+      unstableBalanceMap.set(hashedKey, unstableBalance.sub(Field(1000000)));
 
       console.log('Deposit made');
       console.log(
@@ -120,13 +122,14 @@ async function confirmDeposit(publicKey: PublicKey, txHash: Field) {
 
 async function makePayment(
   publicKey: PublicKey,
-  amount: Field,
+  amount: UInt64,
   destination: PublicKey
 ) {
   const hashedKey = Poseidon.hash(publicKey.toFields());
   const balance = balanceMap.get(hashedKey);
   const witness = balanceMap.getWitness(hashedKey);
   const reputation = reputationMap.get(hashedKey);
+  const a = Mina.getAccount(destinationAddress);
 
   // call smart contract
   const tx = await Mina.transaction(serverAccount, async () => {
@@ -136,7 +139,8 @@ async function makePayment(
 
     let msg = [hash];
     let sig = Signature.create(userKey, msg);
-    AccountUpdate.fundNewAccount(serverAccount);
+    //AccountUpdate.fundNewAccount(serverAccount, 2);
+
     zkApp.makePayment(
       amount,
       publicKey,
@@ -150,7 +154,7 @@ async function makePayment(
   await tx.prove();
   await tx.sign([serverKey]).send();
 
-  balanceMap.set(hashedKey, balance.sub(amount));
+  balanceMap.set(hashedKey, balance.sub(amount.value));
   reputationMap.set(hashedKey, reputation.add(1));
 
   console.log('Payment made');
@@ -179,4 +183,8 @@ console.log('Funds sent');
 
 await confirmDeposit(userAccount.key.toPublicKey(), Field(1));
 
-await makePayment(userAccount.key.toPublicKey(), Field(50), destinationAddress);
+await makePayment(
+  userAccount.key.toPublicKey(),
+  UInt64.from(100000),
+  destinationAddress
+);

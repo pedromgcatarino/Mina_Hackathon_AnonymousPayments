@@ -1,17 +1,22 @@
-import "../styles/globals.css";
+import type { Metadata } from "next";
+import "./globals.css";
+import { ThemeProvider } from "../components/theme-provider";
 
-export const metadata = {
-  title: 'Mina zkApp UI',
-  description: 'built with o1js',
-  icons: {
-    icon: '/assets/favicon.ico',
-  },
+export const metadata: Metadata = {
+  title: "Anonymous Payment System",
+  description: "Deposit and send MINA anonymously on the Devnet",
 };
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body>
+        <ThemeProvider>{children}</ThemeProvider>
+      </body>
     </html>
   );
 }

@@ -125,7 +125,7 @@ export class MinaCash extends SmartContract {
 
   //TODO: Require Signature from sender
   @method async makePayment(
-    amount: Field,
+    amount: UInt64,
     sender: PublicKey,
     destination: PublicKey,
     senderWitness: MerkleMapWitness,
@@ -153,10 +153,10 @@ export class MinaCash extends SmartContract {
     rep.assertEquals(currentReputationRoot);
 
     // Check that balance >= amount
-    previousBalance.assertGreaterThanOrEqual(amount);
+    previousBalance.assertGreaterThanOrEqual(amount.value);
 
     const [newBalancesRoot, key2] = senderWitness.computeRootAndKey(
-      previousBalance.sub(amount)
+      previousBalance.sub(amount.value)
     );
 
     const [newReputationRoot, key4] = senderWitness.computeRootAndKey(
@@ -169,7 +169,7 @@ export class MinaCash extends SmartContract {
     this.reputationMapRoot.set(newReputationRoot);
 
     // Not working -> Invalid fee excess.
-    this.send({ to: destination, amount: amount.toBigInt() });
+    this.send({ to: destination, amount: amount });
   }
 
   @method async getReputation(witness: MerkleWitness8, reputation: Field) {
